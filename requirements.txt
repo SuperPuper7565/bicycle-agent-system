@@ -1,6 +1,16 @@
 langgraph
 langchain
 langchain-community
+langchain-core
+langchain-ollama
+langchain-google-genai
+langchain-chroma
+langchain-mcp-adapters
+langgraph-checkpoint-sqlite
+mcp
+chromadb
+beautifulsoup4
+lxml
 python-dotenv
 pydantic
 httpx
