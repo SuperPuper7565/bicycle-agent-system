@@ -14,3 +14,4 @@ lxml
 python-dotenv
 pydantic
 httpx
+aiosqlite

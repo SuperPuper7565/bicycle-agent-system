@@ -14,6 +14,10 @@ from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# MCP-сервер запускается отдельным процессом: подхватываем .env из корня проекта сами
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 BASE_URL = os.getenv("CATALOG_BASE_URL", "https://velosklad.ru")
 OFFLINE = os.getenv("CATALOG_OFFLINE", "false").lower() == "true"
