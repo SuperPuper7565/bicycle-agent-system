@@ -124,12 +124,14 @@ class TestTexts(unittest.TestCase):
     def test_offer_uses_data_not_model_text(self):
         req = {"category": "mountain", "max_price": 20000, "quantity": 5, "wishes": ["недорогой"]}
         p = {**MOUNTAIN[0], "check": {"met": ["недорогой"], "unmet": []}}
-        rows = [{"product": p, "calc": {"total": 87252, "discount_percent": 3}}]
-        text = logic.render_offer(req, rows, {"intro": "Здравствуйте!"}, date(2026, 10, 20), {"source": "cache"})
+        rows = [{"product": p, "calc": {"total": 89950}}]
+        text = logic.render_offer(req, rows, {"intro": "Здравствуйте!", "advice": "- Размер рамы подбирают по росту"}, date(2026, 10, 20), {"source": "cache"})
         self.assertIn("20.10.2026", text)
         self.assertIn("17 990 ₽ за единицу", text)
-        self.assertIn("скидка 3%", text)
-        self.assertIn("87 252 ₽", text)
+        self.assertNotIn("скидка", text)
+        self.assertIn("89 950 ₽", text)
+        self.assertIn("На что обратить внимание", text)
+        self.assertIn("Размер рамы", text)
         self.assertIn(MOUNTAIN[0]["url"], text)
         self.assertIn("кэша", text)
 
@@ -149,5 +151,121 @@ class TestMemory(unittest.TestCase):
             self.assertIn("city", memory.profile_to_text(prof))
 
 
+class TestTotals(unittest.TestCase):
+    def test_total_is_price_times_quantity_without_discount(self):
+        from mcp_server import catalog
+
+        r = catalog.calculate_total([{"name": "a", "price": 10000}, {"name": "b", "price": 20000}], 10)
+        self.assertEqual(r["total"], 300000)
+        self.assertNotIn("discount_percent", r)
+        self.assertIn("error", catalog.calculate_total([], 0))
+
+
+class TestRequirementsPolicy(unittest.TestCase):
+    def test_numbers_in(self):
+        nums = logic.numbers_in("до двадцати пяти тысяч, колёса 27,5, пять штук, 150 000, 20к, 20 тысяч")
+        for value in (25000, 27.5, 5, 150000, 20000):
+            self.assertIn(float(value), nums)
+
+    def test_ground_drops_invented_values(self):
+        new = {"category": "mountain", "max_price": 15000, "wheel_size": "29",
+               "wishes": ["крутой"], "for_child": True, "quantity": None}
+        out = logic.ground_requirements(new, "хочу велик сынуле купить")
+        self.assertIsNone(out["category"])
+        self.assertIsNone(out["max_price"])
+        self.assertIsNone(out["wheel_size"])
+        self.assertEqual(out["wishes"], [])
+        self.assertTrue(out["for_child"])
+
+    def test_ground_keeps_stated_values(self):
+        text = "Нужен горный велосипед, колёса 29, до 20 000 рублей, недорогой"
+        out = logic.ground_requirements(
+            {"category": "mountain", "max_price": 20000, "wheel_size": "29", "wishes": ["недорогой"]}, text)
+        self.assertEqual((out["category"], out["max_price"], out["wheel_size"]), ("mountain", 20000, "29"))
+        self.assertEqual(out["wishes"], ["недорогой"])
+
+    def test_ground_total_budget_for_several_bikes(self):
+        out = logic.ground_requirements({"max_price": 20000, "quantity": 5}, "5 велосипедов, всего 100 000 рублей")
+        self.assertEqual(out["max_price"], 20000)
+
+    def test_new_order_does_not_inherit_previous(self):
+        prev = {"category": "mountain", "max_price": 15000, "wheel_size": "29", "wishes": ["крутой"]}
+        merged, _, carried = logic.merge_requirements(
+            prev, {"for_child": True}, awaiting=False, text="хочу велик сынуле",
+            profile={"last_category": "mountain"})
+        self.assertFalse(carried)
+        self.assertEqual(merged["category"], "kids")
+        self.assertIsNone(merged.get("max_price"))
+        self.assertIsNone(merged.get("wheel_size"))
+
+    def test_answer_to_question_continues_previous(self):
+        prev = {"category": "kids", "for_child": True}
+        merged, _, carried = logic.merge_requirements(prev, {"child_age": 8}, awaiting=True, text="8 лет", profile={})
+        self.assertTrue(carried)
+        self.assertEqual((merged["category"], merged["child_age"]), ("kids", 8))
+
+    def test_refinement_without_category_continues(self):
+        prev = {"category": "mountain", "wheel_size": "29", "max_price": 20000}
+        merged, _, carried = logic.merge_requirements(
+            prev, {"max_price": 15000}, awaiting=False, text="а до 15 тысяч", profile={})
+        self.assertTrue(carried)
+        self.assertEqual((merged["wheel_size"], merged["max_price"]), ("29", 15000))
+
+    def test_other_category_while_awaiting_starts_new_order(self):
+        prev = {"category": "kids", "for_child": True}
+        merged, _, carried = logic.merge_requirements(
+            prev, {"category": "road", "max_price": 30000}, awaiting=True,
+            text="нет, шоссейный до 30 тысяч", profile={})
+        self.assertFalse(carried)
+        self.assertFalse(merged["for_child"])
+        self.assertEqual(merged["category"], "road")
+
+    def test_profile_only_on_explicit_reference(self):
+        profile = {"last_category": "mountain", "last_max_price": 20000, "last_wheel_size": "29"}
+        m1, _, _ = logic.merge_requirements({}, {}, awaiting=False, text="как в прошлый раз", profile=profile)
+        self.assertEqual((m1["category"], m1["max_price"], m1["wheel_size"]), ("mountain", 20000, "29"))
+        m2, _, _ = logic.merge_requirements({}, {}, awaiting=False, text="хочу велосипед", profile=profile)
+        self.assertIsNone(m2.get("category"))
+
+    def test_next_question_only_when_needed(self):
+        self.assertEqual(logic.next_question({}, False), logic.ASK_CATEGORY)
+        self.assertEqual(logic.next_question({"category": "kids"}, False), logic.ASK_CHILD)
+        self.assertIsNone(logic.next_question({"category": "kids", "child_age": 8}, False))
+        self.assertIsNone(logic.next_question({"category": "kids", "wheel_size": "20"}, False))
+        self.assertIsNone(logic.next_question({"category": "kids"}, True))
+        self.assertIsNone(logic.next_question({"category": "mountain"}, False))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowUpTests(unittest.TestCase):
+    def test_search_command(self):
+        from app.logic import wants_search_now
+        for t in ("найди уже на сайте", "а велики-то ты будешь мне искать?", "подбери"):
+            self.assertTrue(wants_search_now(t), t)
+        self.assertFalse(wants_search_now("какой размер рамы"))
+
+    def test_implausible_age(self):
+        from app.logic import ground_requirements, merge_requirements, next_question, ASK_CHILD_AGAIN
+        new = ground_requirements({"for_child": True, "child_age": 67}, "моему ребенку 67 лет")
+        self.assertIsNone(new["child_age"])
+        merged, _, _ = merge_requirements({"category": "kids", "for_child": True}, new,
+                                          awaiting=True, text="", profile=None)
+        self.assertEqual(next_question(merged, True), ASK_CHILD_AGAIN)
+
+    def test_teen_and_category_reply(self):
+        from app.logic import ground_requirements, merge_requirements, next_question
+        prev = {"category": "kids", "for_child": True}
+        new = ground_requirements({"for_child": True, "child_age": 15, "child_height_cm": 183},
+                                  "моему ребенку 15 лет рост 183 см")
+        merged, _, carried = merge_requirements(prev, new, awaiting=True, text="", profile=None)
+        self.assertTrue(carried)
+        self.assertEqual(merged["category"], "teen")
+        self.assertIsNone(next_question(merged, True))
+        new2 = ground_requirements({"category": "mountain"}, "пусть будет горный велик")
+        m2, _, c2 = merge_requirements(merged, new2, awaiting=True, text="", profile=None)
+        self.assertTrue(c2)
+        self.assertEqual(m2["category"], "mountain")
+        self.assertEqual(m2["child_age"], 15)

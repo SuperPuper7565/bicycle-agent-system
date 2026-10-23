@@ -32,3 +32,6 @@ class State(TypedDict, total=False):
     steps: int
     route: str
     route_reason: str
+    awaiting: bool      # прошлая реплика ассистента была уточняющим вопросом (живёт между репликами)
+    child_asked: bool   # вопрос о возрасте или росте ребёнка уже задавался в этой заявке
+    req_note: str       # откуда требования: новая заявка / уточнение / профиль

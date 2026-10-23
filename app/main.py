@@ -1,6 +1,6 @@
 """Консольный чат с системой.
 
-  python -m app.main                       # диалог (thread=default, user=default)
+  python -m app.main                       # новый диалог при каждом запуске (клиент default)
   python -m app.main --user ivan --thread t1
   python -m app.main --graph               # вывести схему графа в формате Mermaid
 
@@ -17,6 +17,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from . import config
 from .graph import build_graph
 from .mcp_client import load_mcp_tools
+from .logic import summarize_requirements
 from .memory import load_profile, profile_to_text
 
 
@@ -24,6 +25,12 @@ def _print_update(node: str, data: dict | None) -> None:
     data = data or {}
     if node == "supervisor":
         print(f"  [supervisor] -> {data.get('route')}  ({data.get('route_reason')})")
+    elif node == "analyst":
+        req = data.get("requirements")
+        if req:
+            print(f"  [analyst] {data.get('req_note', '')}: {summarize_requirements(req)}")
+        else:
+            print(f"  [analyst] тип запроса: {data.get('intent')}")
     elif node not in ("start_turn", "finalize"):
         print(f"  [{node}] готово")
 
@@ -73,14 +80,14 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--user", default="default")
-    parser.add_argument("--thread", default="default")
+    parser.add_argument("--thread", default=None, help="id диалога (по умолчанию новый при каждом запуске)")
     parser.add_argument("--graph", action="store_true", help="вывести схему графа (Mermaid)")
     args = parser.parse_args()
 
     if args.graph:
         print(build_graph([]).get_graph().draw_mermaid())
         return
-    asyncio.run(chat(args.user, args.thread))
+    asyncio.run(chat(args.user, args.thread or uuid.uuid4().hex[:8]))
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def start_turn(state: dict) -> dict:
         "products": [], "candidates": [], "rejected": [], "checks": [], "ranked": [],
         "kb_notes": "", "search_meta": {}, "answer": "",
         "analyzed": False, "searched": False, "checked": False, "advised": False, "written": False,
-        "steps": 0, "route": "", "route_reason": "",
+        "steps": 0, "route": "", "route_reason": "", "req_note": "",
     }
 
 

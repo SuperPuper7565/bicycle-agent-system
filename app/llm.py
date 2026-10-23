@@ -1,9 +1,13 @@
 """Фабрика моделей: лёгкие задачи -> Qwen (Ollama), сложные -> Gemini."""
+import warnings
 from typing import Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from . import config
+
+# Новые модели Gemini игнорируют temperature и пишут предупреждение при каждом вызове
+warnings.filterwarnings("ignore", message=".*fixed sampling defaults.*")
 
 Role = Literal["light", "heavy"]
 

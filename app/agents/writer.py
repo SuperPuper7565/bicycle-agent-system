@@ -12,9 +12,10 @@ SYSTEM = """Ты составитель коммерческих предлож�
 - intro: 1-2 вежливых предложения вступления.
 - recommendation: 2-3 предложения, какой из вариантов лучше подходит и почему.
   Опирайся только на переданные данные.
-- conditions: условия доставки, сборки, оплаты и гарантии из блока «Условия из базы знаний».
-  Если блок пуст, напиши, что условия уточнит менеджер.
-Не выдумывай характеристики, цены, скидки и сроки. Цены и расчёты в тексте не повторяй."""
+- advice: 2-4 коротких пункта «на что обратить внимание при выборе», списком с дефисами,
+  строго по блоку «Справка из базы знаний». Если блок пуст, верни пустую строку.
+Не выдумывай характеристики, цены, скидки, сроки, условия доставки, оплаты и гарантии.
+Цены и расчёты в тексте не повторяй."""
 
 TOP_N = 3
 
@@ -57,7 +58,7 @@ def make_writer(tools: list):
         prompt = (
             f"Заявка: {json.dumps(req, ensure_ascii=False)}\n"
             f"Варианты (от лучшего):\n{json.dumps(facts, ensure_ascii=False, indent=1)}\n\n"
-            f"Условия из базы знаний:\n{state.get('kb_notes') or '(нет данных)'}"
+            f"Справка из базы знаний:\n{state.get('kb_notes') or '(нет данных)'}"
         )
         texts: dict = {}
         try:
@@ -68,8 +69,8 @@ def make_writer(tools: list):
                 texts = result.model_dump()
         except Exception:
             texts = {}
-        if not texts.get("conditions") and state.get("kb_notes"):
-            texts["conditions"] = state["kb_notes"]  # условия из RAG не теряем даже при сбое модели
+        if not texts.get("advice") and state.get("kb_notes"):
+            texts["advice"] = state["kb_notes"]  # справку из RAG не теряем даже при сбое модели
 
         offer = render_offer(req, rows, texts, date.today(), meta)
         return {"answer": offer, "written": True}

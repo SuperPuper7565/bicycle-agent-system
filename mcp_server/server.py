@@ -46,7 +46,7 @@ def get_product(url: str) -> dict:
 
 @mcp.tool()
 def calculate_total(items: list[dict], quantity: int = 1) -> dict:
-    """Рассчитать итоговую стоимость выбранных товаров с учётом оптовой скидки.
+    """Рассчитать итоговую стоимость выбранных товаров: цена × количество (скидки не применяются).
 
     Args:
         items: список товаров (поля name и price).

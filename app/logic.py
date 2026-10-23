@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 
 CATEGORY_RU = {
@@ -14,6 +15,7 @@ CATEGORY_RU = {
     "city": "городской",
     "hybrid": "гибридный",
     "kids": "детский",
+    "teen": "подростковый",
 }
 
 SPEC_LABELS = {
@@ -95,6 +97,13 @@ def summarize_requirements(req: dict) -> str:
         parts.append(f"бюджет: до {format_rub(req['max_price'])} за единицу")
     if req.get("wheel_size"):
         parts.append(f"колёса: {normalize_wheel(req['wheel_size'])}″")
+    if req.get("child_age") or req.get("child_height_cm"):
+        bits = []
+        if req.get("child_age"):
+            bits.append(f"{req['child_age']} лет")
+        if req.get("child_height_cm"):
+            bits.append(f"рост {req['child_height_cm']} см")
+        parts.append("ребёнок: " + ", ".join(bits))
     if req.get("must_have"):
         parts.append("обязательно: " + ", ".join(req["must_have"]))
     if req.get("wishes"):
@@ -258,17 +267,203 @@ def render_offer(req: dict, rows: list[dict], texts: dict, today: date, meta: di
         if check.get("unmet"):
             lines.append("   - Не выполнено: " + ", ".join(check["unmet"]))
         if calc.get("total") is not None:
-            qty = (req.get("quantity") or 1)
-            discount = calc.get("discount_percent", 0)
-            extra = f", скидка {discount}%" if discount else ""
-            lines.append(f"   - Количество: {qty}{extra}, итого: {format_rub(calc['total'])}")
+            qty = req.get("quantity") or 1
+            lines.append(f"   - Количество: {qty}, итого: {format_rub(calc['total'])}")
         if p.get("url"):
             lines.append(f"   - Ссылка: {p['url']}")
     if texts.get("recommendation"):
         lines += ["", "## Рекомендация", texts["recommendation"]]
-    if texts.get("conditions"):
-        lines += ["", "## Условия", texts["conditions"]]
-    lines += ["", "## Примечание", "Наличие и срок поставки подтверждаются менеджером. Цены действительны 3 рабочих дня."]
+    if texts.get("advice"):
+        lines += ["", "## На что обратить внимание", texts["advice"]]
+    lines += ["", "## Примечание", "Цены, наличие, сроки поставки, условия оплаты и доставки подтверждаются менеджером."]
     if meta.get("source") == "cache":
         lines.append("Данные каталога получены из локального кэша, перед отправкой клиенту актуальность цен нужно проверить.")
     return "\n".join(lines)
+
+
+# ---------- разбор заявки: контекст, выдумки и вопросы решает код, а не модель ----------
+
+ASK_CATEGORY = "Какой тип велосипеда вам нужен: горный, шоссейный, городской, гибридный или детский?"
+ASK_CHILD_AGAIN = "Возраст ребёнка указан необычно. Напишите, пожалуйста, сколько ему лет (до 17) или какой у него рост в см."
+ASK_CHILD = "Сколько лет ребёнку или какой у него рост? От этого зависит размер колёс."
+
+# По этим словам считаем, что клиент сам назвал тип велосипеда. Иначе значение модели отбрасывается.
+CATEGORY_HINTS = {
+    "mountain": r"\b(?:горн|mtb|мтб|маунтин|бездорож|грунт|лес)",
+    "road": r"\b(?:шосс|асфальт)",
+    "city": r"\b(?:город|дорожн|прогулоч|работ)",
+    "hybrid": r"\bгибрид",
+    "kids": r"\b(?:дет|ребен|сын|доч|внук|малыш|школьн)",
+}
+
+# Числа словами (текст сравнивается после замены ё на е).
+NUM_WORDS = {
+    "один": 1, "одного": 1, "одна": 1, "два": 2, "две": 2, "двух": 2, "три": 3, "трех": 3,
+    "четыре": 4, "четырех": 4, "пять": 5, "пяти": 5, "шесть": 6, "шести": 6, "семь": 7, "семи": 7,
+    "восемь": 8, "восьми": 8, "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15,
+    "пятнадцати": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19,
+    "двадцать": 20, "двадцати": 20, "тридцать": 30, "тридцати": 30, "сорок": 40, "сорока": 40,
+    "пятьдесят": 50, "пятидесяти": 50, "шестьдесят": 60, "шестидесяти": 60, "семьдесят": 70,
+    "семидесяти": 70, "восемьдесят": 80, "восьмидесяти": 80, "девяносто": 90, "девяноста": 90,
+    "сто": 100, "ста": 100,
+}
+
+PAST_ORDER_RE = re.compile(
+    r"как\s+(?:в\s+)?прошл|как\s+раньше|как\s+обычно|повтори|такой\s+же\s+как|то\s+же\s+самое",
+    re.IGNORECASE,
+)
+
+SCALAR_FIELDS = ("category", "quantity", "max_price", "wheel_size", "child_height_cm", "child_age")
+
+
+def _norm(text: str) -> str:
+    return (text or "").lower().replace("ё", "е").replace("\xa0", " ")
+
+
+def _as_float(value):
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def numbers_in(text: str) -> set[float]:
+    """Все числа из сообщения: цифрами, «20 тысяч», «20к», «двадцать пять тысяч», «пять»."""
+    t = _norm(text)
+    nums: set[float] = set()
+    for m in re.finditer(r"(\d+(?:[.,]\d+)?)\s*(?:тысяч\w*|тыс\b\.?|к\b)", t):
+        nums.add(float(m.group(1).replace(",", ".")) * 1000)
+    for m in re.finditer(r"\d{1,3}(?:\s\d{3})+|\d+(?:[.,]\d+)?", t):
+        nums.add(float(re.sub(r"\s", "", m.group(0)).replace(",", ".")))
+    for m in re.finditer(r"((?:[а-я]+\s+){0,2}[а-я]+)\s+тысяч\w*", t):
+        values = [NUM_WORDS[w] for w in m.group(1).split() if w in NUM_WORDS]
+        if values:
+            nums.add(float(sum(values) * 1000))
+    for w in re.findall(r"[а-я]+", t):
+        if w in NUM_WORDS:
+            nums.add(float(NUM_WORDS[w]))
+    return nums
+
+
+def category_supported(category: str | None, text: str) -> bool:
+    pattern = CATEGORY_HINTS.get(category or "")
+    return bool(pattern and re.search(pattern, _norm(text)))
+
+
+def _phrase_supported(phrase: str, text_norm: str) -> bool:
+    words = re.findall(r"[a-zа-я0-9]{4,}", _norm(phrase))
+    return not words or any(w[:5] in text_norm for w in words)
+
+
+def ground_requirements(new: dict, text: str) -> dict:
+    """Убрать значения, которых клиент не называл (защита от выдумок слабой модели)."""
+    out = dict(new)
+    nums = numbers_in(text)
+    text_norm = _norm(text)
+    qty = out.get("quantity") or 1
+
+    price = _as_float(out.get("max_price"))
+    if out.get("max_price") is not None and (price is None or not ({price, price * qty} & nums)):
+        out["max_price"] = None  # допускаем и общий бюджет на несколько штук
+    for key in ("wheel_size", "child_age", "child_height_cm"):
+        value = _as_float(out.get(key))
+        if out.get(key) is not None and (value is None or value not in nums):
+            out[key] = None
+    age, height = _as_float(out.get("child_age")), _as_float(out.get("child_height_cm"))
+    if age is not None and not 1 <= age <= 17:
+        out["child_age"] = None  # «ребёнку 67 лет»: неправдоподобно, спросим ещё раз
+        out["bad_age"] = True
+    if height is not None and not 60 <= height <= 200:
+        out["child_height_cm"] = None
+    if out.get("category") and not category_supported(out["category"], text):
+        out["category"] = None
+    if out.get("for_child") and not category_supported("kids", text):
+        out["for_child"] = False
+    for key in ("must_have", "wishes"):
+        out[key] = [p for p in (out.get(key) or []) if _phrase_supported(p, text_norm)]
+    return out
+
+
+SEARCH_RE = re.compile(r"найд|ищи|иска|поищ|подбер|покаж|давай|начин", re.IGNORECASE)
+
+
+def wants_search_now(text: str) -> bool:
+    """Клиент просит выполнить поиск («найди уже на сайте», «а ты будешь искать?»)."""
+    return bool(SEARCH_RE.search(_norm(text)))
+
+
+def has_order_data(req: dict) -> bool:
+    """В сообщении есть данные заказа: тип, ребёнок или параметры."""
+    return bool(
+        req.get("category") or req.get("for_child") or req.get("bad_age")
+        or any(req.get(k) for k in ("max_price", "wheel_size", "child_age", "child_height_cm", "quantity"))
+        or req.get("must_have") or req.get("wishes")
+    )
+
+
+def wants_past_order(text: str) -> bool:
+    return bool(PAST_ORDER_RE.search(text or ""))
+
+
+def merge_requirements(prev: dict | None, new: dict, *, awaiting: bool, text: str, profile: dict | None):
+    """Собрать итоговые требования. Возвращает (требования, пояснение, продолжена_ли_прошлая_заявка).
+
+    Прошлая заявка переносится только если ассистент только что задал вопрос (awaiting) или клиент
+    уточняет её («а подешевле»). Иначе это новая заявка с чистого листа. Профиль клиента
+    используется только по прямой ссылке («как в прошлый раз»).
+    """
+    prev = prev or {}
+    has_params = (
+        any(new.get(k) for k in ("max_price", "wheel_size", "child_age", "child_height_cm", "quantity"))
+        or bool(new.get("must_have"))
+        or bool(new.get("wishes"))
+    )
+    refines = bool(new.get("refines_previous")) or (
+        not new.get("category") and not new.get("for_child") and has_params and bool(prev.get("category"))
+    )
+    carried = bool(prev) and (awaiting or refines)
+    if (carried and awaiting and new.get("category") and prev.get("category")
+            and new["category"] != prev["category"]
+            and not (prev["category"] in ("kids", "teen") and (prev.get("child_age") or prev.get("child_height_cm")))):
+        carried = False  # на вопрос не ответили и назвали другой тип: это новая заявка
+
+    base = dict(prev) if carried else {}
+    merged: dict = dict(base)
+    for key in SCALAR_FIELDS:
+        if new.get(key) is not None:
+            merged[key] = new[key]
+    for key in ("must_have", "wishes"):
+        merged[key] = list(dict.fromkeys((base.get(key) or []) + (new.get(key) or [])))
+    merged["for_child"] = bool(base.get("for_child") or new.get("for_child"))
+
+    note = "уточнение прошлой заявки" if carried else "новая заявка"
+    if wants_past_order(text) and profile:
+        filled = False
+        for pkey, field in (("last_category", "category"), ("last_max_price", "max_price"),
+                            ("last_wheel_size", "wheel_size"), ("last_quantity", "quantity")):
+            if merged.get(field) is None and profile.get(pkey):
+                merged[field] = profile[pkey]
+                filled = True
+        if filled:
+            note += ", дополнено из профиля клиента"
+    if merged["for_child"] and not merged.get("category"):
+        merged["category"] = "kids"
+    if merged.get("category") == "kids":
+        age, height = _as_float(merged.get("child_age")), _as_float(merged.get("child_height_cm"))
+        if (age is not None and age >= 14) or (height is not None and height >= 150):
+            merged["category"] = "teen"  # подросток: в детском разделе подходящих размеров нет
+    merged["bad_age"] = bool(new.get("bad_age"))
+    return merged, note, carried
+
+
+def next_question(req: dict, child_asked: bool) -> str | None:
+    """Уточняющий вопрос нужен только в двух случаях: неизвестен тип или для ребёнка неизвестен размер."""
+    if req.get("bad_age") and not (req.get("child_height_cm") or req.get("wheel_size")):
+        return ASK_CHILD_AGAIN
+    if not req.get("category"):
+        return ASK_CATEGORY
+    has_size_info = req.get("child_age") or req.get("child_height_cm") or req.get("wheel_size")
+    if req["category"] == "kids" and not has_size_info and not child_asked:
+        return ASK_CHILD
+    return None
