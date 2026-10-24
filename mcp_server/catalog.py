@@ -1,14 +1,16 @@
-"""Логика каталога: загрузка страницы, детерминированный парсинг, локальный кэш.
+"""Логика каталога: загрузка страниц velosklad.ru, детерминированный парсинг (без LLM).
 
-Парсинг выполняется обычным кодом (BeautifulSoup), без участия LLM.
-Если сайт недоступен, изменилась вёрстка или включён CATALOG_OFFLINE,
-используется локальный снимок data/catalog_cache.json.
+Источники данных:
+  live         страницы раздела с листанием ?p=1, ?p=2, ... (по умолчанию)
+  saved_pages  HTML-страницы, сохранённые вручную в mcp_server/pages/<категория>*.html
+               (если сайт недоступен или CATALOG_OFFLINE=true)
+Демо-товаров нет: если нет ни живых, ни сохранённых данных, поиск честно возвращает ошибку.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -21,9 +23,11 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 BASE_URL = os.getenv("CATALOG_BASE_URL", "https://www.velosklad.ru")
 OFFLINE = os.getenv("CATALOG_OFFLINE", "false").lower() == "true"
-CACHE_PATH = Path(__file__).parent / "data" / "catalog_cache.json"
+PAGES_DIR = Path(__file__).parent / "pages"
+MAX_PAGES = int(os.getenv("CATALOG_MAX_PAGES", "10"))       # страниц на раздел (по ~21 товару)
+PAGE_DELAY = float(os.getenv("CATALOG_PAGE_DELAY", "0.5"))  # пауза между страницами, секунд
+CACHE_TTL = 600                                              # сек: повторные поиски без запросов к сайту
 
-# Реальные пути категорий на сайте velosklad.ru
 CATEGORY_PATHS = {
     "mountain": "/velosipedy/type/gornye/",
     "road": "/velosipedy/type/shosseynyie/",
@@ -35,25 +39,23 @@ CATEGORY_PATHS = {
     "full_suspension": "/velosipedy/type/dvuhpodvesy/",
 }
 
-# Признак ссылки на карточку товара. Карточки ищутся ПО ЭТИМ ссылкам, а не по классам-оберткам:
-# так в результат не попадают фильтры, меню и баннеры. Если после изменений поиск всегда
-# уходит в кэш, сначала проверьте, что реальные ссылки товаров содержат именно эту часть пути.
-MODEL_PATH = "/velosipedy/model/"
+# Вёрстка velosklad.ru: карточка = div.ah-products-list__col (разметка schema.org).
+CARD_SELECTOR = ".ah-products-list__col"
+NAME_SELECTOR = "a.ah-products-item__name"
+PRICE_META = "meta[itemprop='price']"
+STOCK_SELECTOR = ".ah-products-item__stock"
+SPEC_ROW = ".ah-characteristics__row"
+BIKE_PATH = "/velosipedy/bike/"
 
-# Селекторы проверяются ПО ОЧЕРЕДИ, сверху вниз (приоритет). Раньше они были одним списком
-# через запятую, но select_one возвращает первый элемент в порядке документа, и приоритет
-# не работал: брался внешний блок .price со старой и новой ценой вместе.
-TITLE_SELECTORS = [
-    ".product-title", ".item-title", ".name",
-    "[class*='title']", "[class*='name']", "h3", "h2",
-]
-PRICE_SELECTORS = [
-    ".price-new", ".current-price", ".product-price", ".item-price",
-    ".price", "[class*='price']",
-]
-STOP_TITLES = {"подробнее", "купить", "сравнить"}
+SPEC_KEYS = {  # название характеристики на сайте -> ключ у нас
+    "диаметр колес": "wheel_size",
+    "тип тормозов": "brakes",
+    "тип рамы": "frame",
+    "тип вилки": "fork",
+    "скорости": "speeds",
+    "вес": "weight",
+}
 
-# Стандартный User-Agent браузера, чтобы не срабатывала антибот-защита
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -63,142 +65,133 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-
-def _load_cache() -> list[dict]:
-    if not CACHE_PATH.exists():
-        return []
-    with open(CACHE_PATH, encoding="utf-8") as f:
-        return json.load(f)
+_memory: dict[str, tuple[float, str, list[dict]]] = {}  # category -> (время, источник, товары)
 
 
-def _first(node, selectors: list[str]):
-    """Первый найденный элемент по списку селекторов с учётом приоритета."""
-    for sel in selectors:
-        el = node.select_one(sel)
-        if el is not None:
-            return el
-    return None
+def _parse_wheel(value: str) -> str | None:
+    m = re.search(r"(\d{2}(?:[.,]\d)?)", value or "")
+    return m.group(1).replace(",", ".") if m else None
 
 
-# Сумма: группы по 3 цифры через пробел/nbsp («25 990») или просто 4-7 цифр («25990»).
-# (?<!\d) не даёт начать число из середины другого числа (артикул + цена не склеиваются).
-_AMOUNT = r"(?<!\d)(\d{1,3}(?:[\s\xa0]\d{3})+|\d{4,7})"
-_RUB = re.compile(_AMOUNT + r"\s*(?:₽|руб|р\.)", re.IGNORECASE)
-_BARE = re.compile(_AMOUNT + r"(?!\d)")
-
-
-def _parse_price(text: str) -> int | None:
-    """Актуальная цена в рублях. Если в тексте рядом старая и новая цена, берём меньшую."""
-    if not text:
-        return None
-    for pattern in (_RUB, _BARE):  # сначала суммы со знаком рубля, затем «голые» числа
-        values = [int(re.sub(r"\D", "", raw)) for raw in pattern.findall(text)]
-        values = [v for v in values if 1000 <= v <= 9_999_999]
-        if values:
-            return min(values)
-    return None
-
-
-def _extract_specs(title: str) -> dict:
-    """Достаём характеристики из названия (диаметр колёс и модельный год)."""
+def _specs_from_card(card) -> dict:
     specs: dict = {}
-    if not title:
-        return specs
-
-    # 1. Ищем диаметр с кавычками или словом "дюйм" (например: 29", 27.5 дюймов)
-    m_explicit = re.search(r'(\d{2}(?:[.,]\d)?)\s*(?:"|”|дюйм|\'\')', title, re.IGNORECASE)
-    if m_explicit:
-        specs["wheel_size"] = m_explicit.group(1).replace(",", ".")
-    else:
-        # 2. На velosklad.ru диаметр пишется прямо в названии: "Forward Sporting 29 (2026)"
-        m_size = re.search(
-            r"\b(12|14|16|18|20|24|26|27[.,]5|28|29|32)\b(?!\s*(?:ск|скорост|г\.|год))",
-            title,
-        )
-        if m_size:
-            specs["wheel_size"] = m_size.group(1).replace(",", ".")
-
-    # Дополнительно извлекаем год модели в скобках, если есть: "(2025)" или "(2026)"
-    m_year = re.search(r"\((20\d{2})\)", title)
-    if m_year:
-        specs["year"] = int(m_year.group(1))
-
+    for row in card.select(SPEC_ROW):
+        label = row.select_one(".ah-characteristics__text")
+        value = row.select_one(".ah-characteristics__value")
+        if not label or not value:
+            continue
+        key = SPEC_KEYS.get(label.get_text(" ", strip=True).rstrip(":").strip().lower())
+        text = value.get_text(" ", strip=True)
+        if not key or not text:
+            continue
+        if key == "wheel_size":
+            text = _parse_wheel(text)
+            if not text:
+                continue
+        specs[key] = text.lower() if key in ("brakes", "frame", "fork") else text
     return specs
 
 
-def _model_links(node):
-    return node.select(f"a[href*='{MODEL_PATH}']")
-
-
-def _find_card(link):
-    """Поднимаемся от ссылки на модель к ближайшему контейнеру, где есть цена.
-
-    Если в контейнере уже несколько разных товаров, значит поднялись слишком высоко.
-    """
-    node = link.parent
-    for _ in range(6):
-        if node is None or node.name in ("body", "html", "[document]"):
-            return None
-        urls = {a.get("href", "").split("#")[0] for a in _model_links(node)}
-        if len(urls) > 1:
-            return None
-        if _first(node, PRICE_SELECTORS) is not None:
-            return node
-        node = node.parent
-    return None
-
-
-def parse_listing(html: str, category: str) -> list[dict]:
+def parse_listing(html: str, category: str, source: str = "live") -> list[dict]:
+    """Разобрать страницу раздела: товары с названием, ценой, ссылкой и характеристиками."""
     soup = BeautifulSoup(html, "lxml")
     products: list[dict] = []
-    seen_urls: set[str] = set()
-
-    for link in _model_links(soup):
-        href = link.get("href", "").strip()
-        url = urljoin(BASE_URL, href.split("#")[0])
-        if url in seen_urls:
+    seen: set[str] = set()
+    for card in soup.select(CARD_SELECTOR):
+        link = card.select_one(NAME_SELECTOR)
+        if link is None:
             continue
-
-        card = _find_card(link)
-        if card is None:
+        href = link.get("href", "").split("?")[0].split("#")[0].strip()
+        if BIKE_PATH not in href:
             continue
-
-        # Название: самый длинный текст среди ссылок на эту модель (ссылка-картинка пустая),
-        # иначе заголовок карточки.
-        title = max((a.get_text(" ", strip=True) for a in _model_links(card)), key=len, default="")
-        if len(title) < 4 or title.lower() in STOP_TITLES:
-            el = _first(card, TITLE_SELECTORS)
-            title = el.get_text(" ", strip=True) if el else ""
-        if len(title) < 4 or title.lower() in STOP_TITLES:
+        url = urljoin(BASE_URL, href)
+        name = link.get_text(" ", strip=True)
+        if url in seen or len(name) < 4:
             continue
+        seen.add(url)
 
-        price_el = _first(card, PRICE_SELECTORS)
-        price = _parse_price(price_el.get_text(" ", strip=True)) if price_el else None
-
-        seen_urls.add(url)
+        price_el = card.select_one(PRICE_META)
+        try:
+            price = int(float(price_el.get("content", ""))) if price_el else None
+        except ValueError:
+            price = None
+        stock_el = card.select_one(STOCK_SELECTOR)
+        stock = stock_el.get_text(" ", strip=True) if stock_el else ""
+        specs = _specs_from_card(card)
+        m_year = re.search(r"\((20\d{2})\)", name)
+        if m_year:
+            specs["year"] = int(m_year.group(1))
         products.append(
             {
-                "name": title,
+                "name": name,
                 "price": price,
                 "currency": "RUB",
                 "url": url,
                 "category": category,
-                "specs": _extract_specs(title),
-                "source": "live",
+                "specs": specs,
+                "stock": stock,
+                "source": source,
             }
         )
     return products
 
 
 def _fetch_live(category: str) -> list[dict]:
+    """Листаем ?p=1, ?p=2, ... пока на странице появляются новые товары (но не больше MAX_PAGES)."""
     path = CATEGORY_PATHS.get(category)
     if not path:
         return []
-    target_url = urljoin(BASE_URL, path)
-    with httpx.Client(headers=HEADERS, timeout=15.0, follow_redirects=True) as client:
-        resp = client.get(target_url)
-        resp.raise_for_status()
-    return parse_listing(resp.text, category)
+    base = urljoin(BASE_URL, path)
+    items: list[dict] = []
+    seen: set[str] = set()
+    with httpx.Client(headers=HEADERS, timeout=20.0, follow_redirects=True) as client:
+        for page in range(1, MAX_PAGES + 1):
+            resp = client.get(base, params={"p": page} if page > 1 else None)
+            resp.raise_for_status()
+            fresh = [p for p in parse_listing(resp.text, category) if p["url"] not in seen]
+            if not fresh:
+                break  # страницы закончились (или сайт отдал ту же страницу)
+            seen.update(p["url"] for p in fresh)
+            items.extend(fresh)
+            time.sleep(PAGE_DELAY)
+    return items
+
+
+def _load_saved(category: str) -> list[dict]:
+    """Страницы, сохранённые вручную: mcp_server/pages/<категория>.html, <категория>_2.html, ..."""
+    items: list[dict] = []
+    seen: set[str] = set()
+    for f in sorted(PAGES_DIR.glob(f"{category}*.html")):
+        html = f.read_text(encoding="utf-8", errors="ignore")
+        for p in parse_listing(html, category, source="saved_pages"):
+            if p["url"] not in seen:
+                seen.add(p["url"])
+                items.append(p)
+    return items
+
+
+def load_category(category: str) -> tuple[list[dict], str, str]:
+    """Товары раздела: (товары, источник, пояснение). Источник: live / saved_pages / error."""
+    cached = _memory.get(category)
+    if cached and time.time() - cached[0] < CACHE_TTL:
+        return cached[2], cached[1], ""
+    note = ""
+    if not OFFLINE:
+        try:
+            items = _fetch_live(category)
+            if items:
+                _memory[category] = (time.time(), "live", items)
+                return items, "live", ""
+            note = "Сайт ответил, но карточки не найдены (возможно, сменилась вёрстка)."
+        except Exception as exc:  # сеть, 4xx/5xx, таймаут
+            note = f"Сайт недоступен ({type(exc).__name__})."
+    items = _load_saved(category)
+    if items:
+        _memory[category] = (time.time(), "saved_pages", items)
+        return items, "saved_pages", note
+    return [], "error", (note + " " if note else "") + (
+        f"Нет и сохранённых страниц: положите HTML раздела в {PAGES_DIR.name}/{category}.html."
+    )
 
 
 def _matches(p: dict, category: str, max_price: int | None, wheel_size: str | None) -> bool:
@@ -222,61 +215,31 @@ def search(
     wheel_size: str | None = None,
     limit: int = 10,
 ) -> dict:
-    """Поиск товаров. Возвращает данные и признак источника (live / cache)."""
-    source = "cache"
-    items: list[dict] = []
-    note = ""
-    if not OFFLINE:
-        try:
-            items = _fetch_live(category)
-            if items:
-                source = "live"
-            else:
-                note = "Сайт ответил, но карточки не найдены (возможно, сменилась вёрстка). Использован кэш."
-        except Exception as exc:  # сеть, 4xx/5xx, таймаут
-            note = f"Сайт недоступен ({type(exc).__name__}). Использован кэш."
-    if not items:
-        items = _load_cache()
-        source = "cache"
-
+    """Поиск товаров. Возвращает данные и признак источника (live / saved_pages / error)."""
+    items, source, note = load_category(category)
     found = [p for p in items if _matches(p, category, max_price, wheel_size)]
     found.sort(key=lambda p: (p.get("price") is None, p.get("price") or 0))
     return {
         "source": source,
         "note": note,
+        "total_in_category": len(items),
         "count": len(found[:limit]),
         "items": found[:limit],
     }
 
 
 def get_product(url: str) -> dict:
-    """Карточка товара по URL (сначала ищет в кэше, затем пробует спарсить вживую)."""
-    for p in _load_cache():
-        if p.get("url") == url:
-            return p
-
-    if not OFFLINE and url.startswith("http"):
-        try:
-            with httpx.Client(headers=HEADERS, timeout=15.0, follow_redirects=True) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-            h1 = soup.find("h1")
-            title = h1.get_text(" ", strip=True) if h1 else "Неизвестная модель"
-            price_el = _first(soup, PRICE_SELECTORS)
-            price = _parse_price(price_el.get_text(" ", strip=True)) if price_el else None
-            return {
-                "name": title,
-                "price": price,
-                "currency": "RUB",
-                "url": url,
-                "specs": _extract_specs(title),
-                "source": "live",
-            }
-        except Exception as exc:
-            return {"error": f"Не удалось загрузить карточку {url}: {exc}"}
-
-    return {"error": f"Товар с URL {url} не найден"}
+    """Карточка товара по ссылке из уже загруженных разделов (отдельную страницу товара не парсим)."""
+    url = url.split("?")[0].split("#")[0]
+    for _, _, items in _memory.values():
+        for p in items:
+            if p.get("url") == url:
+                return p
+    for category in CATEGORY_PATHS:
+        for p in _load_saved(category):
+            if p.get("url") == url:
+                return p
+    return {"error": f"Товар {url} не найден среди загруженных разделов: сначала выполните search_catalog"}
 
 
 def calculate_total(items: list[dict], quantity: int = 1) -> dict:

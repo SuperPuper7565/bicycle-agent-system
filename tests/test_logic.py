@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import logic, memory  # noqa: E402
 
 CACHE = json.loads(
-    (Path(__file__).resolve().parent.parent / "mcp_server" / "data" / "catalog_cache.json").read_text(encoding="utf-8")
+    (Path(__file__).resolve().parent / "fixtures" / "demo_products.json").read_text(encoding="utf-8")
 )
 MOUNTAIN = [p for p in CACHE if p["category"] == "mountain"]
 
@@ -116,16 +116,16 @@ class TestTexts(unittest.TestCase):
     def test_no_results_suggests_budget(self):
         req = {"category": "mountain", "max_price": 10000, "quantity": 1, "must_have": []}
         _, rejected = logic.hard_filter(MOUNTAIN, req)
-        text = logic.no_results_text(req, rejected, {"source": "cache"})
+        text = logic.no_results_text(req, rejected, {"source": "saved_pages"})
         self.assertIn("не нашлось", text)
         self.assertIn("увеличить бюджет до 13 990 ₽", text)
-        self.assertIn("кэша", text)
+        self.assertIn("сохранённых страниц", text)
 
     def test_offer_uses_data_not_model_text(self):
         req = {"category": "mountain", "max_price": 20000, "quantity": 5, "wishes": ["недорогой"]}
         p = {**MOUNTAIN[0], "check": {"met": ["недорогой"], "unmet": []}}
         rows = [{"product": p, "calc": {"total": 89950}}]
-        text = logic.render_offer(req, rows, {"intro": "Здравствуйте!", "advice": "- Размер рамы подбирают по росту"}, date(2026, 10, 20), {"source": "cache"})
+        text = logic.render_offer(req, rows, {"intro": "Здравствуйте!", "advice": "- Размер рамы подбирают по росту"}, date(2026, 10, 20), {"source": "saved_pages"})
         self.assertIn("20.10.2026", text)
         self.assertIn("17 990 ₽ за единицу", text)
         self.assertNotIn("скидка", text)
@@ -133,7 +133,7 @@ class TestTexts(unittest.TestCase):
         self.assertIn("На что обратить внимание", text)
         self.assertIn("Размер рамы", text)
         self.assertIn(MOUNTAIN[0]["url"], text)
-        self.assertIn("кэша", text)
+        self.assertIn("сохранённых страниц", text)
 
 
 class TestMemory(unittest.TestCase):
@@ -269,3 +269,56 @@ class FollowUpTests(unittest.TestCase):
         self.assertTrue(c2)
         self.assertEqual(m2["category"], "mountain")
         self.assertEqual(m2["child_age"], 15)
+
+
+class ChildSizeParsingTests(unittest.TestCase):
+    def test_garbage_answer_is_asked_again_even_if_model_returned_nothing(self):
+        from app.logic import ground_requirements, merge_requirements, next_question, ASK_CHILD_AGAIN
+        t = "моему ребенку 67 лет рост 1488 см"
+        new = ground_requirements({"intent": "order", "for_child": True}, t)
+        merged, _, _ = merge_requirements({"category": "kids", "for_child": True}, new,
+                                          awaiting=True, text=t, profile=None)
+        self.assertEqual(next_question(merged, True), ASK_CHILD_AGAIN)
+
+    def test_age_parsed_without_model(self):
+        from app.logic import ground_requirements
+        new = ground_requirements({"for_child": True}, "сыну 12 лет, рост 150 см")
+        self.assertEqual((new["child_age"], new["child_height_cm"]), (12.0, 150.0))
+
+
+class ListingParserTests(unittest.TestCase):
+    HTML = """
+    <div class="ah-products-list__col" itemscope>
+      <a href="/velosipedy/bike/28433/stels-navigator-620-v-26-k010/" class="ah-products-item__img"><img></a>
+      <div class="ah-products-item__stock">В наличии</div>
+      <a itemprop="url" href="/velosipedy/bike/28433/stels-navigator-620-v-26-k010/" class="ah-products-item__name">Велосипед Stels Navigator 620 V 26 K010 (2025)</a>
+      <a href="/velosipedy/bike/28433/stels-navigator-620-v-26-k010/?addcomment=1#coment">11</a>
+      <meta itemprop="price" content="19990">
+      <div class="ah-products-item__old-price">24 990</div>
+      <div class="ah-characteristics__row"><div class="ah-characteristics__text">Диаметр колес:</div><div class="ah-characteristics__value">26 дюймов</div></div>
+      <div class="ah-characteristics__row"><div class="ah-characteristics__text">Тип тормозов:</div><div class="ah-characteristics__value">Ободные механические</div></div>
+    </div>
+    <div class="ah-products-list__col"><a href="/velosipedy/">Все велосипеды</a></div>
+    """
+
+    def test_real_layout(self):
+        from mcp_server import catalog
+        items = catalog.parse_listing(self.HTML, "mountain")
+        self.assertEqual(len(items), 1)
+        p = items[0]
+        self.assertEqual(p["price"], 19990)  # не старая цена
+        self.assertEqual(p["url"], "https://www.velosklad.ru/velosipedy/bike/28433/stels-navigator-620-v-26-k010/")
+        self.assertEqual(p["specs"]["wheel_size"], "26")
+        self.assertEqual(p["specs"]["brakes"], "ободные механические")
+        self.assertEqual(p["stock"], "В наличии")
+
+    def test_no_demo_fallback(self):
+        from mcp_server import catalog
+        catalog._memory.clear()
+        old = (catalog.OFFLINE, catalog.PAGES_DIR)
+        catalog.OFFLINE, catalog.PAGES_DIR = True, Path("/nonexistent")
+        try:
+            r = catalog.search("mountain")
+        finally:
+            catalog.OFFLINE, catalog.PAGES_DIR = old
+        self.assertEqual((r["source"], r["count"]), ("error", 0))

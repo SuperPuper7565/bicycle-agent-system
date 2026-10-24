@@ -222,8 +222,10 @@ def no_results_text(req: dict, rejected: list[dict], meta: dict) -> str:
         "",
         "**Ваши требования:** " + summarize_requirements(req),
     ]
-    if meta.get("source") == "cache":
-        lines.append("_Данные получены из локального кэша каталога, актуальность нужно проверить._")
+    if meta.get("source") == "saved_pages":
+        lines.append("_Данные взяты из сохранённых страниц каталога, актуальность нужно проверить._")
+    if meta.get("source") == "error":
+        lines.append(f"_Каталог недоступен: {meta.get('note') or 'нет данных'}_")
     if rejected:
         nearest = sorted(rejected, key=lambda r: r["product"].get("price") or 10**9)[:3]
         lines += ["", "**Ближайшие варианты, которые не подошли:**"]
@@ -276,8 +278,8 @@ def render_offer(req: dict, rows: list[dict], texts: dict, today: date, meta: di
     if texts.get("advice"):
         lines += ["", "## На что обратить внимание", texts["advice"]]
     lines += ["", "## Примечание", "Цены, наличие, сроки поставки, условия оплаты и доставки подтверждаются менеджером."]
-    if meta.get("source") == "cache":
-        lines.append("Данные каталога получены из локального кэша, перед отправкой клиенту актуальность цен нужно проверить.")
+    if meta.get("source") == "saved_pages":
+        lines.append("Данные каталога взяты из сохранённых страниц, перед отправкой клиенту актуальность цен нужно проверить.")
     return "\n".join(lines)
 
 
@@ -370,12 +372,20 @@ def ground_requirements(new: dict, text: str) -> dict:
         value = _as_float(out.get(key))
         if out.get(key) is not None and (value is None or value not in nums):
             out[key] = None
+    # Возраст и рост разбираем и сами по тексту: слабая модель их часто не возвращает
+    m_age = re.search(r"(\d{1,3})\s*(?:лет|года?\b|г\.)", text_norm)
+    m_h = re.search(r"(?:рост\w*\s*)?(\d{2,4})\s*(?:см|сантим)|рост\w*\s*(?:у\w+\s+)?(\d{2,4})", text_norm)
+    if out.get("child_age") is None and m_age:
+        out["child_age"] = float(m_age.group(1))
+    if out.get("child_height_cm") is None and m_h:
+        out["child_height_cm"] = float(m_h.group(1) or m_h.group(2))
     age, height = _as_float(out.get("child_age")), _as_float(out.get("child_height_cm"))
     if age is not None and not 1 <= age <= 17:
         out["child_age"] = None  # «ребёнку 67 лет»: неправдоподобно, спросим ещё раз
         out["bad_age"] = True
     if height is not None and not 60 <= height <= 200:
         out["child_height_cm"] = None
+        out["bad_age"] = True
     if out.get("category") and not category_supported(out["category"], text):
         out["category"] = None
     if out.get("for_child") and not category_supported("kids", text):
